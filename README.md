@@ -53,30 +53,19 @@ Since we only need to swap a static field value at startup (no method patching n
 
 ## Installation
 
-### Prerequisites
-
-- StretchSense XR Game installed at `C:\Program Files\StretchSense\XRGame\`
-- [Unity Doorstop 4.x](https://github.com/NeighTools/UnityDoorstop/releases) `winhttp.dll` in the game directory
-
 ### Steps
 
-1. **Download** `DoorstopFix.dll` from the [Releases](../../releases) page
+1. **Download** `DoorstopFix-v*.zip` from the [Releases](../../releases) page
 
-2. **Copy** `DoorstopFix.dll` into the game directory:
+2. **Extract all files** into the game directory:
    ```
-   C:\Program Files\StretchSense\XRGame\DoorstopFix.dll
-   ```
-
-3. **Install Doorstop** (if not already present): copy `winhttp.dll` from the [Doorstop 4.x release](https://github.com/NeighTools/UnityDoorstop/releases) (x64) into the game directory
-
-4. **Create/edit** `doorstop_config.ini` in the game directory:
-   ```ini
-   [General]
-   enabled=true
-   target_assembly=DoorstopFix.dll
+   C:\Program Files\StretchSense\XRGame\
+   ├── DoorstopFix.dll          (the patch)
+   ├── winhttp.dll              (Unity Doorstop 4.5 loader)
+   └── doorstop_config.ini      (configuration)
    ```
 
-5. **Launch the game normally** — the fix applies automatically
+3. **Launch the game normally** — the fix applies automatically
 
 ### Verifying It Works
 

@@ -20,8 +20,16 @@ jobs:
       - name: Build
         run: dotnet build DoorstopFix/DoorstopFix.csproj -c Release
 
+      - name: Package release zip
+        run: |
+          mkdir -p release
+          cp DoorstopFix/bin/Release/netstandard2.1/DoorstopFix.dll release/
+          cp doorstop/winhttp.dll release/
+          cp doorstop/doorstop_config.ini release/
+          cd release && zip ../DoorstopFix-${{ github.ref_name }}.zip *
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: DoorstopFix/bin/Release/netstandard2.1/DoorstopFix.dll
+          files: DoorstopFix-${{ github.ref_name }}.zip
           generate_release_notes: true
