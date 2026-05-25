@@ -1,6 +1,14 @@
 # XR Game Memory Leak Fix
 
+[![Patreon donate button](https://img.shields.io/badge/patreon-donate-yellow.svg)](https://www.patreon.com/qdot)
+[![Github donate button](https://img.shields.io/badge/github-donate-ff69b4.svg)](https://www.github.com/sponsors/qdot)
+[![bluesky](https://img.shields.io/bluesky/followers/buttplug.engineer)](https://bsky.app/profile/buttplug.engineer)
+
 A runtime patch for the [StretchSense XR Game](https://stretchsense.com/) that fixes a memory leak caused by unbounded reactive buffers in the hand-tracking pipeline.
+
+## Support
+
+If you have any issues with the mod, I'm qdot on discord, am around the Stretchsense server. As I've just gotten back to using my gloves, I'm not sure if this is the fix to the leak everyone has been seeing, but it does seem to have reduced memory footprint growth for me.
 
 ## The Problem
 
