@@ -1,5 +1,6 @@
 # XR Game Memory Leak Fix
 
+[![Patreon donate button](https://img.shields.io/badge/kofi-donate-green.svg)](https://www.ko-fi.com/qdot76367)
 [![Patreon donate button](https://img.shields.io/badge/patreon-donate-yellow.svg)](https://www.patreon.com/qdot)
 [![Github donate button](https://img.shields.io/badge/github-donate-ff69b4.svg)](https://www.github.com/sponsors/qdot)
 [![bluesky](https://img.shields.io/bluesky/followers/buttplug.engineer)](https://bsky.app/profile/buttplug.engineer)
