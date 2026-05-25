@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -24,4 +24,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: DoorstopFix
-          path: DoorstopFix/bin/Release/netstandard2.1/DoorstopFix.dll
+          path: DoorstopFix/bin/Release/net48/

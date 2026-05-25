@@ -5,13 +5,15 @@
 [![Github donate button](https://img.shields.io/badge/github-donate-ff69b4.svg)](https://www.github.com/sponsors/qdot)
 [![bluesky](https://img.shields.io/bluesky/followers/buttplug.engineer)](https://bsky.app/profile/buttplug.engineer)
 
-A runtime patch for the [StretchSense XR Game](https://stretchsense.com/) that fixes a memory leak caused by unbounded reactive buffers in the hand-tracking pipeline.
+A runtime patch for the [StretchSense XR Game](https://stretchsense.com/) that fixes a memory leak and GC crash caused by issues in the hand-tracking pipeline.
 
 ## Support
 
 If you have any issues with the mod, I'm qdot on discord, am around the Stretchsense server. As I've just gotten back to using my gloves, I'm not sure if this is the fix to the leak everyone has been seeing, but it does seem to have reduced memory footprint growth for me.
 
-## The Problem
+## The Problems
+
+### 1. Memory Leak: Unbounded ReplaySubjects
 
 `ArticulationManager` in `StretchSense.Pipeline.dll` declares two `ReplaySubject<BoneTransforms>` instances without specifying a buffer size:
 
@@ -23,42 +25,54 @@ private static readonly Dictionary<Handedness, ReplaySubject<BoneTransforms>> An
 };
 ```
 
-The R3 reactive library's `ReplaySubject<T>()` constructor (no arguments) defaults to `bufferSize = int.MaxValue` — it stores **every value ever emitted** and never trims. Every other `ReplaySubject` in the codebase correctly uses `new ReplaySubject<T>(1)`.
+R3's `ReplaySubject<T>()` constructor defaults to `bufferSize = int.MaxValue` — it stores **every value ever emitted** and never trims. During glove calibration (PRECAPTURE state), `AnimatorOutput` receives a `BoneTransforms` object every frame — ~120 objects/second accumulating forever.
 
-During glove calibration (PRECAPTURE state), `AnimatorOutput` receives a `BoneTransforms` object every frame. At 60fps with two gloves, that's ~120 objects/second accumulating forever — roughly 430,000 objects per hour, never freed.
+### 2. GC Crash: Per-Frame Allocation Pressure
+
+Multiple hot paths allocate objects every frame that, over ~2 hours of use, cause Mono's Boehm GC to crash with **"Fatal Error In GC - Unexpected mark stack overflow"**:
+
+| Hotspot | Allocations/sec | Issue |
+|---------|----------------|-------|
+| `OscMessage.Construct` | 120-2400 | `new MemoryStream` + LINQ + `byte[4]` per call |
+| `KinematicsStream.KinematicMessage` | 120 | `new List<object>` + 51 boxed floats + `.ToArray()` |
+| `MLModelManager` mask methods | 360 | `.Select().ToArray()` creating new `float[]` each call |
+
+Mono's Boehm GC is conservative and non-compacting. These allocations cause heap fragmentation that grows monotonically until the GC's internal mark stack overflows during collection.
 
 ### Symptoms
 
-- Memory usage climbs steadily over time (10-50+ MB/min during calibration)
-- Never returns to baseline, even after calibration finishes
-- Eventually causes performance degradation or OOM crashes in long sessions
+- Memory climbs steadily during calibration (never freed)
+- After ~2 hours of normal use: **"Fatal Error In GC - Unexpected mark stack overflow"** crash
+- Affects machines regardless of available RAM (it's a GC infrastructure limit, not OOM)
 
-## The Fix
+## The Fixes
 
-Replace each unbounded `ReplaySubject<BoneTransforms>()` with `ReplaySubject<BoneTransforms>(1)`, which retains only the most recent value. This is semantically correct — subscribers only ever need the latest bone transforms for rendering.
+### Fix 1: ReplaySubject Swap (via reflection)
+
+Replace each unbounded `ReplaySubject<BoneTransforms>()` with `ReplaySubject<BoneTransforms>(1)` which retains only the most recent value. Applied early at startup via pure reflection.
+
+### Fix 2: Harmony Method Patches (reduces allocation rate)
+
+Using [Harmony](https://github.com/pardeike/Harmony), we patch the hot methods to reuse cached buffers:
+
+- **OscMessage.Construct**: Thread-local `MemoryStream` reuse, manual type-tag building (no LINQ), reused `byte[4]` buffer
+- **MLModelManager mask methods**: Cached `float[]` output arrays instead of `.Select().ToArray()` per frame
+- **KinematicsStream.KinematicMessage**: Pre-allocated `object[]` array, cached `Enum.GetValues` result
 
 ## How It Works
 
-This mod uses [Unity Doorstop](https://github.com/NeighTools/UnityDoorstop) to inject code before the game starts:
+1. [Unity Doorstop](https://github.com/NeighTools/UnityDoorstop) (`winhttp.dll` proxy) loads `DoorstopFix.dll` at process startup
+2. We register an `AppDomain.AssemblyLoad` handler to detect when game assemblies load
+3. When `StretchSense.CompanionApp.Runtime` loads, we apply the ReplaySubject fix via reflection
+4. After a short delay (letting Unity finish its load sequence), we apply Harmony patches on a background thread
 
-1. **Doorstop** (a `winhttp.dll` proxy already used by BepInEx-style mods) loads `DoorstopFix.dll` at process startup
-2. `Doorstop.Entrypoint.Start()` registers an `AppDomain.AssemblyLoad` event handler
-3. When `StretchSense.Pipeline.dll` loads, the handler fires
-4. We force `ArticulationManager`'s static constructor via `RuntimeHelpers.RunClassConstructor` to ensure the field is initialized
-5. We replace both `ReplaySubject` instances in the dictionary via reflection
-6. Old subjects are disposed to free any accumulated buffer
-
-The entire fix is **pure reflection** — no compile-time dependencies on game assemblies. This makes it resilient to minor game updates and buildable without proprietary DLLs.
+The delay before Harmony patches is intentional — Harmony's runtime detours must be applied after Mono's assembly loader is idle, or they interfere with the JIT.
 
 ## Why Not BepInEx?
 
-We originally built this as a BepInEx 5 plugin with Harmony patches. However:
-
-- **BepInEx 5 is incompatible with Unity 6** (which XR Game uses — version 6000.3.2f1)
-- Doorstop 4.5 loads fine, but BepInEx's Preloader crashes with "Undefined ManagedTempMemScopePolicy"
-- BepInEx 6 bleeding-edge might work but is unstable and harder to distribute
-
-Since we only need to swap a static field value at startup (no method patching needed), using Doorstop directly is simpler, more reliable, and has zero framework overhead.
+- **BepInEx 5 is incompatible with Unity 6** (crashes with "Undefined ManagedTempMemScopePolicy")
+- BepInEx 6 bleeding-edge is unstable
+- Doorstop + standalone Harmony is simpler and more reliable
 
 ## Installation
 
@@ -69,7 +83,9 @@ Since we only need to swap a static field value at startup (no method patching n
 2. **Extract all files** into the game directory:
    ```
    C:\Program Files\StretchSense\XRGame\
-   ├── DoorstopFix.dll          (the patch)
+   ├── DoorstopFix\
+   │   ├── DoorstopFix.dll      (the patch)
+   │   └── 0Harmony.dll         (Harmony runtime patching library)
    ├── winhttp.dll              (Unity Doorstop 4.5 loader)
    └── doorstop_config.ini      (configuration)
    ```
@@ -78,19 +94,26 @@ Since we only need to swap a static field value at startup (no method patching n
 
 ### Verifying It Works
 
-Check `doorstop_fix.log` in the game directory after launching:
+Check `DoorstopFix\doorstop_fix.log` in the game directory after launching:
 ```
-[2026-05-24 19:57:49.921] DoorstopFix loaded - waiting for StretchSense.Pipeline assembly...
-[2026-05-24 19:57:50.420] StretchSense.Pipeline loaded - patching ArticulationManager...
-[2026-05-24 19:57:50.425] Forced ArticulationManager static constructor
-[2026-05-24 19:57:50.435] Replaced unbounded ReplaySubject for LEFT with bufferSize=1
-[2026-05-24 19:57:50.435] Replaced unbounded ReplaySubject for RIGHT with bufferSize=1
-[2026-05-24 19:57:50.436] Patch complete - 2/2 ReplaySubjects replaced. Memory leak fixed!
+[...] DoorstopFix v2.0 loaded - waiting for game assemblies...
+[...] StretchSense.CompanionApp.Runtime loaded
+[...]   Forced ArticulationManager static constructor
+[...]   Replaced ReplaySubject for LEFT with bufferSize=1
+[...]   Replaced ReplaySubject for RIGHT with bufferSize=1
+[...]   ReplaySubject fix complete: 2/2 replaced
+[...] Applying Harmony patches (deferred)...
+[...]   Patched OscMessage.Construct (pooled MemoryStream + no LINQ)
+[...]   Patched GetJoystickMaskedCapacitances (cached float[] output)
+[...]   Patched GetGestureMaskedCapacitances (cached float[] output)
+[...]   Patched GetArticulationMaskedCapacitances (cached float[] output)
+[...]   Patched KinematicsStream.KinematicMessage (cached object[], cached Enum.GetValues)
+[...]   Harmony patches applied successfully
 ```
 
 ### Uninstalling
 
-Set `enabled=false` in `doorstop_config.ini`, or delete `DoorstopFix.dll` and `winhttp.dll`.
+Set `enabled=false` in `doorstop_config.ini`, or delete the `DoorstopFix\` folder and `winhttp.dll`.
 
 ## Building from Source
 
@@ -99,21 +122,20 @@ cd DoorstopFix
 dotnet build -c Release
 ```
 
-Output: `DoorstopFix/bin/Release/netstandard2.1/DoorstopFix.dll`
+Output: `DoorstopFix/bin/Release/net48/DoorstopFix.dll` + `0Harmony.dll`
 
-Requirements: .NET SDK 6.0+ (targets netstandard2.1)
+Requirements: .NET SDK 6.0+ (targets net48 for Unity Mono compatibility)
 
 ## Technical Details
 
 | | |
 |---|---|
 | **Game** | StretchSense XR Game |
-| **Engine** | Unity 6 (6000.3.2f1), Mono runtime |
-| **Target assembly** | StretchSense.Pipeline.dll |
-| **Target type** | `StretchSense.Pipeline.ArticulationManager` |
-| **Target field** | `AnimatorOutput` (private static) |
-| **Reactive library** | R3 (Cysharp) |
-| **Injection method** | Unity Doorstop 4.x |
+| **Engine** | Unity 6 (6000.3.2f1), Mono runtime (Boehm GC) |
+| **Target assemblies** | StretchSense.Pipeline.dll, StretchSense.CompanionApp.Runtime.dll |
+| **Patching** | Reflection (ReplaySubject swap) + Harmony 2.3 (method patches) |
+| **Injection** | Unity Doorstop 4.5 |
+| **Build target** | net48 (Unity Mono compatible) |
 
 ## License
 

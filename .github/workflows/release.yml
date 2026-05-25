@@ -6,7 +6,7 @@ on:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     permissions:
       contents: write
     steps:
@@ -21,12 +21,13 @@ jobs:
         run: dotnet build DoorstopFix/DoorstopFix.csproj -c Release
 
       - name: Package release zip
+        shell: bash
         run: |
-          mkdir -p release
-          cp DoorstopFix/bin/Release/netstandard2.1/DoorstopFix.dll release/
+          mkdir -p release/DoorstopFix
+          cp DoorstopFix/bin/Release/net48/*.dll release/DoorstopFix/
           cp doorstop/winhttp.dll release/
           cp doorstop/doorstop_config.ini release/
-          cd release && zip ../DoorstopFix-${{ github.ref_name }}.zip *
+          cd release && 7z a ../DoorstopFix-${{ github.ref_name }}.zip *
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
