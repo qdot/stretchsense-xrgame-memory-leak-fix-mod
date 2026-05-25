@@ -1,0 +1,24 @@
+# Build outputs
+**/bin/
+**/obj/
+
+# Staging/working files (not part of the distributable)
+bepinex-staging/
+doorstop4-staging/
+decompiled/
+*.zip
+
+# IDE
+.vs/
+.idea/
+*.user
+*.suo
+
+# Logs
+*.log
+
+# Old scripts (kept locally for reference)
+install_bepinex.bat
+install_doorstop4.bat
+install_plugin.bat
+check_certs.ps1
