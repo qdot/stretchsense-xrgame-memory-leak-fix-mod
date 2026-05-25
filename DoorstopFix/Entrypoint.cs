@@ -1,249 +1,185 @@
 // =============================================================================
-// DoorstopFix - Memory Leak Patch for StretchSense XR Game
+// DoorstopFix - Memory Leak & GC Pressure Fix for StretchSense XR Game
 // =============================================================================
 //
-// This mod fixes a memory leak in the StretchSense XR Game caused by unbounded
-// ReplaySubject<BoneTransforms> instances in ArticulationManager.
+// This mod fixes two categories of issues:
 //
-// HOW IT WORKS:
-// Unity Doorstop (winhttp.dll proxy) loads this DLL before any game code runs.
-// We subscribe to AppDomain.AssemblyLoad to detect when the game's pipeline
-// assembly loads, then use reflection to replace the leaking objects.
+// 1. MEMORY LEAK: Unbounded ReplaySubject<BoneTransforms> in ArticulationManager
+//    (fixed via reflection - no dependencies needed)
 //
-// WHY REFLECTION:
-// By using pure reflection with no compile-time references to game assemblies,
-// this DLL has zero dependencies beyond the .NET runtime. This means:
-//   - It builds without needing game DLLs on the build machine
-//   - It's resilient to minor game updates (field names/types rarely change)
-//   - CI/CD can build it without proprietary assets
+// 2. GC PRESSURE: Per-frame allocations that overflow Mono's Boehm GC mark stack
+//    (fixed via HarmonyX method patches - loaded AFTER game assemblies are ready)
 //
-// THE BUG:
-// ArticulationManager declares:
-//   static readonly Dictionary<Handedness, ReplaySubject<BoneTransforms>> AnimatorOutput = new() {
-//       { LEFT,  new ReplaySubject<BoneTransforms>() },   // <-- NO BUFFER SIZE
-//       { RIGHT, new ReplaySubject<BoneTransforms>() }    // <-- NO BUFFER SIZE
-//   };
-//
-// R3's ReplaySubject() without a buffer size defaults to int.MaxValue, meaning it
-// stores EVERY value ever emitted and never trims. Since AnimatorOutput receives
-// BoneTransforms every frame during calibration (PRECAPTURE state), this grows
-// unboundedly: ~120 objects/sec with two gloves, never freed.
-//
-// THE FIX:
-// Replace each ReplaySubject<BoneTransforms>() with ReplaySubject<BoneTransforms>(1),
-// which keeps only the most recent value. This is semantically correct because
-// subscribers only ever need the latest bone transforms.
+// IMPORTANT ARCHITECTURE NOTE:
+// MonoMod (which Harmony uses) hooks into Mono's JIT when it loads. This
+// interferes with AppDomain.AssemblyLoad events if loaded too early. Therefore:
+//   - Phase 1 (early): ReplaySubject fix via pure reflection (no Harmony)
+//   - Phase 2 (deferred): Harmony patches loaded ONLY after game assemblies exist
 // =============================================================================
 
 using System;
 using System.IO;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Threading;
 
+// ReSharper disable InconsistentNaming (Harmony conventions use __instance, __result)
 namespace Doorstop
 {
-    /// <summary>
-    /// Unity Doorstop entrypoint. Doorstop calls Start() before any game code runs.
-    /// The method signature must be exactly: static void Doorstop.Entrypoint.Start()
-    /// </summary>
     public class Entrypoint
     {
-        /// <summary>
-        /// Log file path — placed next to the DLL (which is in the game's root directory).
-        /// </summary>
         private static readonly string LogPath = Path.Combine(
             Path.GetDirectoryName(typeof(Entrypoint).Assembly.Location) ?? ".",
             "doorstop_fix.log");
 
-        /// <summary>
-        /// Doorstop calls this before Unity loads any game assemblies.
-        /// We can't patch yet because the target types don't exist, so we register
-        /// an event handler to detect when the target assembly loads.
-        /// </summary>
+        internal static readonly string OurDirectory =
+            Path.GetDirectoryName(typeof(Entrypoint).Assembly.Location) ?? ".";
+
         public static void Start()
         {
-            Log("DoorstopFix loaded - waiting for StretchSense.Pipeline assembly...");
-
-            // AssemblyLoad fires after an assembly is loaded but before its types are used.
-            // This is the perfect interception point: types are available for reflection,
-            // but no game code has called into them yet.
+            Log("DoorstopFix v2.0 loaded - waiting for game assemblies...");
             AppDomain.CurrentDomain.AssemblyLoad += OnAssemblyLoad;
         }
 
-        /// <summary>
-        /// Fired every time a new assembly is loaded into the AppDomain.
-        /// We watch for StretchSense.Pipeline.dll specifically.
-        /// </summary>
+        private static bool _applied = false;
+        private static bool _replaySubjectFixed = false;
+
         private static void OnAssemblyLoad(object sender, AssemblyLoadEventArgs args)
         {
-            if (args.LoadedAssembly.GetName().Name != "StretchSense.Pipeline")
-                return;
+            var name = args.LoadedAssembly.GetName().Name;
 
-            Log("StretchSense.Pipeline loaded - patching ArticulationManager...");
+            // Wait for CompanionApp.Runtime — it depends on Pipeline, so when it loads
+            // we know all game assemblies are available. Pipeline's AssemblyLoad event
+            // sometimes doesn't fire separately on Mono (loaded as transitive dep).
+            if (name == "StretchSense.CompanionApp.Runtime" && !_applied)
+            {
+                _applied = true;
+                Log("StretchSense.CompanionApp.Runtime loaded");
+
+                // Phase 1: Apply ReplaySubject fix immediately (pure reflection)
+                try
+                {
+                    // Find Pipeline assembly (already loaded as dependency)
+                    Assembly pipelineAsm = null;
+                    foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                    {
+                        if (asm.GetName().Name == "StretchSense.Pipeline")
+                        {
+                            pipelineAsm = asm;
+                            break;
+                        }
+                    }
+
+                    if (pipelineAsm != null)
+                    {
+                        ReplaySubjectFix.Apply(pipelineAsm);
+                        _replaySubjectFixed = true;
+                    }
+                    else
+                    {
+                        Log("  Pipeline not yet enumerable - will retry in deferred phase");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"ERROR in ReplaySubject fix: {ex}");
+                }
+
+                // Unsubscribe before loading Harmony
+                AppDomain.CurrentDomain.AssemblyLoad -= OnAssemblyLoad;
+
+                // Phase 2: Defer all remaining patches to a thread pool thread.
+                // This ensures the current assembly load chain completes first,
+                // and prevents Harmony's runtime patching from interfering with Mono's
+                // assembly loader.
+                ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    // Wait for Unity to finish loading all assemblies
+                    Thread.Sleep(2000);
+
+                    // Retry ReplaySubject fix if it wasn't applied yet
+                    // (Pipeline may not have been enumerable during the synchronous phase)
+                    if (!_replaySubjectFixed)
+                    {
+                        try
+                        {
+                            Assembly pipelineAsm2 = null;
+                            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                            {
+                                if (asm.GetName().Name == "StretchSense.Pipeline")
+                                {
+                                    pipelineAsm2 = asm;
+                                    break;
+                                }
+                            }
+                            if (pipelineAsm2 != null)
+                            {
+                                ReplaySubjectFix.Apply(pipelineAsm2);
+                                _replaySubjectFixed = true;
+                            }
+                            else
+                            {
+                                Log("  ERROR: Pipeline assembly STILL not found");
+                            }
+                        }
+                        catch (Exception ex2)
+                        {
+                            Log($"ERROR in deferred ReplaySubject fix: {ex2}");
+                        }
+                    }
+
+                    ApplyHarmonyPatches();
+                });
+            }
+        }
+
+        /// <summary>
+        /// Loads Harmony and applies GC pressure patches.
+        /// Called on a background thread AFTER game assemblies are loaded.
+        /// Separated into its own method with NoInlining to prevent the JIT from
+        /// eagerly resolving Harmony types during earlier code paths.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static void ApplyHarmonyPatches()
+        {
+            Log("Applying Harmony patches (deferred)...");
+
+            // NOW it's safe to register the assembly resolver for Harmony's deps
+            AppDomain.CurrentDomain.AssemblyResolve += ResolveOurDependencies;
 
             try
             {
-                PatchAnimatorOutput(args.LoadedAssembly);
+                GcPressurePatches.Apply();
             }
             catch (Exception ex)
             {
-                Log($"ERROR during patching: {ex}");
+                Log($"ERROR in Harmony patches: {ex}");
             }
-
-            // Unsubscribe regardless of success — we only need to run once
-            AppDomain.CurrentDomain.AssemblyLoad -= OnAssemblyLoad;
         }
 
         /// <summary>
-        /// Core patching logic. Replaces unbounded ReplaySubjects with bounded ones.
-        ///
-        /// Steps:
-        /// 1. Force ArticulationManager's static constructor to run (initializes the field)
-        /// 2. Read the AnimatorOutput dictionary via reflection
-        /// 3. For each hand (LEFT, RIGHT), create a new ReplaySubject(bufferSize: 1)
-        /// 4. Swap it into the dictionary, dispose the old one
+        /// Resolves Harmony and its dependencies (MonoMod, Cecil) from our directory.
+        /// Only active AFTER game assemblies are loaded.
         /// </summary>
-        private static void PatchAnimatorOutput(Assembly pipelineAssembly)
+        private static Assembly ResolveOurDependencies(object sender, ResolveEventArgs args)
         {
-            // --- Step 1: Get the ArticulationManager type ---
-            var artMgrType = pipelineAssembly.GetType("StretchSense.Pipeline.ArticulationManager");
-            if (artMgrType == null)
+            var assemblyName = new AssemblyName(args.Name).Name;
+            var path = Path.Combine(OurDirectory, assemblyName + ".dll");
+            if (File.Exists(path))
             {
-                Log("ERROR: Could not find ArticulationManager type");
-                return;
+                return Assembly.LoadFrom(path);
             }
-
-            // Force the static constructor (.cctor) to run NOW. This ensures the
-            // AnimatorOutput field initializer has executed, populating the dictionary.
-            // Without this, the field might still be null (beforefieldinit semantics
-            // allow the CLR to defer initialization until first access).
-            RuntimeHelpers.RunClassConstructor(artMgrType.TypeHandle);
-            Log("Forced ArticulationManager static constructor");
-
-            // --- Step 2: Get the AnimatorOutput field value ---
-            var field = artMgrType.GetField("AnimatorOutput",
-                BindingFlags.Static | BindingFlags.NonPublic);
-            if (field == null)
-            {
-                Log("ERROR: Could not find AnimatorOutput field (was it renamed in an update?)");
-                return;
-            }
-
-            // The field is: Dictionary<Handedness, ReplaySubject<BoneTransforms>>
-            var dict = field.GetValue(null);
-            if (dict == null)
-            {
-                Log("ERROR: AnimatorOutput is null after forcing static constructor");
-                return;
-            }
-
-            // --- Step 3: Resolve types we need via reflection ---
-            var handednessType = pipelineAssembly.GetType("StretchSense.Pipeline.Handedness");
-            var boneTransformsType = pipelineAssembly.GetType("StretchSense.Pipeline.BoneTransforms");
-
-            if (handednessType == null || boneTransformsType == null)
-            {
-                Log("ERROR: Could not find Handedness or BoneTransforms types");
-                return;
-            }
-
-            // R3 should already be loaded as a dependency of StretchSense.Pipeline.
-            // Find it in the loaded assemblies.
-            Assembly r3Assembly = null;
-            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                if (asm.GetName().Name == "R3")
-                {
-                    r3Assembly = asm;
-                    break;
-                }
-            }
-            if (r3Assembly == null)
-            {
-                Log("ERROR: R3 assembly not loaded (expected as dependency of Pipeline)");
-                return;
-            }
-
-            // Build the closed generic type: ReplaySubject<BoneTransforms>
-            var replaySubjectOpen = r3Assembly.GetType("R3.ReplaySubject`1");
-            if (replaySubjectOpen == null)
-            {
-                Log("ERROR: Could not find R3.ReplaySubject`1 type");
-                return;
-            }
-            var replaySubjectType = replaySubjectOpen.MakeGenericType(boneTransformsType);
-
-            // Get the constructor: ReplaySubject(int bufferSize)
-            var ctor = replaySubjectType.GetConstructor(new[] { typeof(int) });
-            if (ctor == null)
-            {
-                Log("ERROR: Could not find ReplaySubject(int bufferSize) constructor");
-                return;
-            }
-
-            // Get Dispose(bool callOnCompleted) for cleanup of old subjects.
-            // R3's ReplaySubject.Dispose(false) frees the buffer without notifying subscribers.
-            var disposeMethod = replaySubjectType.GetMethod("Dispose", new[] { typeof(bool) });
-
-            // --- Step 4: Swap the subjects for each hand ---
-            var dictType = dict.GetType();
-            var indexerProp = dictType.GetProperty("Item");             // dict[key] accessor
-            var containsKeyMethod = dictType.GetMethod("ContainsKey");
-
-            var leftValue = Enum.Parse(handednessType, "LEFT");
-            var rightValue = Enum.Parse(handednessType, "RIGHT");
-
-            int patched = 0;
-            foreach (var hand in new[] { leftValue, rightValue })
-            {
-                // Verify the key exists (defensive — it should always be there)
-                bool exists = (bool)containsKeyMethod.Invoke(dict, new[] { hand });
-                if (!exists)
-                {
-                    Log($"WARNING: No entry for {hand} in AnimatorOutput dictionary");
-                    continue;
-                }
-
-                // Get the old unbounded subject
-                var oldSubject = indexerProp.GetValue(dict, new[] { hand });
-
-                // Create replacement: ReplaySubject<BoneTransforms>(bufferSize: 1)
-                // bufferSize=1 means only the latest value is retained for replay
-                var newSubject = ctor.Invoke(new object[] { 1 });
-
-                // Swap it in
-                indexerProp.SetValue(dict, newSubject, new[] { hand });
-
-                // Dispose old subject to free accumulated buffer memory.
-                // Pass false = don't call OnCompleted on subscribers (they should keep working).
-                if (oldSubject != null && disposeMethod != null)
-                {
-                    try { disposeMethod.Invoke(oldSubject, new object[] { false }); }
-                    catch (Exception) { /* Disposal failure is non-fatal */ }
-                }
-
-                Log($"Replaced unbounded ReplaySubject for {hand} with bufferSize=1");
-                patched++;
-            }
-
-            Log($"Patch complete - {patched}/2 ReplaySubjects replaced. Memory leak fixed!");
+            return null;
         }
 
-        /// <summary>
-        /// Simple file logger. We can't use Unity's Debug.Log this early in the boot process,
-        /// and we don't have BepInEx's logging infrastructure, so we write to a plain text file.
-        /// </summary>
-        private static void Log(string message)
+        public static void Log(string message)
         {
             try
             {
                 var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {message}{Environment.NewLine}";
                 File.AppendAllText(LogPath, line);
             }
-            catch
-            {
-                // If we can't write logs, there's nothing we can do — fail silently
-            }
+            catch { }
         }
     }
 }
