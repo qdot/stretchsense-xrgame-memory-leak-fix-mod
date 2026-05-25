@@ -1,0 +1,27 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build
+        run: dotnet build DoorstopFix/DoorstopFix.csproj -c Release
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: DoorstopFix/bin/Release/netstandard2.1/DoorstopFix.dll
+          generate_release_notes: true
