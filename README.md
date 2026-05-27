@@ -15,7 +15,7 @@ The current build identifies as:
 DoorstopFix v3.4.7 monitored native mark stack + BLE guard
 ```
 
-This is a field-test build. It has survived multi-hour local soak tests that previously crashed with `Fatal Error In GC - Unexpected mark stack overflow`, but it still keeps diagnostic heap logging enabled and the managed heap can continue to grow slowly during long sessions.
+This is a field-tested build. It has survived multi-hour local soak tests that previously crashed with `Fatal Error In GC - Unexpected mark stack overflow`, including staged Mono mark-stack growth through 8 MB. It still keeps diagnostic heap logging enabled, and the managed heap/process memory can continue to grow during long sessions.
 
 ## Problems
 
@@ -25,7 +25,7 @@ This is a field-test build. It has survived multi-hour local soak tests that pre
 
 ### Mono GC Mark-Stack Overflow
 
-XR Game uses Unity Mono with Boehm GC. During long sessions the GC mark stack can grow through small staged sizes and eventually overflow while scanning a large fragmented heap. This presents as a Mono fatal error or an access violation in `mono-2.0-bdwgc.dll`.
+XR Game uses Unity Mono with Boehm GC. During long sessions the GC mark stack grows through small staged sizes and can eventually overflow while scanning a large fragmented heap. This presents as a Mono fatal error or an access violation in `mono-2.0-bdwgc.dll`.
 
 ### Per-Frame Allocation Pressure
 
@@ -49,11 +49,13 @@ Repeated Bluetooth connect/disconnect paths can leave stale glove state and noti
 
 The patch replaces the unbounded `ReplaySubject<BoneTransforms>` instances with `ReplaySubject<BoneTransforms>(1)` via reflection once the game assemblies are available.
 
-### Native Mark-Stack Monitor
+### Native Mark-Stack Patch
 
-The patch sets `MONO_GC_PARAMS=mark-stack-size=33554432` and also directly replaces Mono's Boehm mark-stack globals with a 32 MB native allocation.
+The effective crash fix is a direct native patch of Mono's Boehm mark-stack globals. At startup, and again whenever Mono later resets its own mark stack, DoorstopFix replaces the active mark stack with a 32 MB native allocation.
 
-This Unity/Mono build can later overwrite those globals while it grows the stack from 64 KB through larger stages. A background monitor checks every 5 seconds and re-expands the mark stack when Mono resets it to a smaller size.
+This Unity/Mono build grows the stack in stages from small sizes like 64 KB, 256 KB, 1 MB, 2 MB, 4 MB, and 8 MB. A background monitor checks every 5 seconds and re-expands the mark stack when Mono resets it to a smaller size.
+
+DoorstopFix also sets `MONO_GC_PARAMS=mark-stack-size=33554432` as a best-effort hint, but local testing showed that this environment variable is not sufficient by itself for this Unity/Mono build. The native replacement log line is the important verification signal.
 
 Successful replacement allocations are intentionally retained. Testing showed that freeing an older replacement immediately after swapping globals can crash in `mono-2.0-bdwgc.dll`, which means Mono can still briefly touch older stack memory.
 
@@ -102,6 +104,8 @@ Harmony patches applied successfully
 Native mark stack monitor started (checking every 5s)
 Heap monitor started (logging every 60s)
 ```
+
+The `MONO_GC_PARAMS` line is expected, but it is not enough to prove the fix is active. Verify that at least one `Native mark stack replaced` line appears and that the startup banner says `v3.4.7`.
 
 During long sessions, additional lines like this are expected:
 
