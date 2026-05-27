@@ -18,6 +18,12 @@
 // 3. KinematicsStream.KinematicMessage - replaces per-call List<object> + boxing
 //    with a cached object[] array (~120 calls/sec, ~51 boxed objects per call)
 //
+// 4. ControllerStream.ControllerMessage - replaces per-call object[17] with cached
+//    array (~120 calls/sec with 2 gloves)
+//
+// 5. OrientationStream.OrientationMessage - replaces per-call object[12] with cached
+//    array (~120 calls/sec with 2 gloves)
+//
 // HOW HARMONY PATCHES WORK:
 // A "Prefix" that returns false completely replaces the original method.
 // Our prefix does the same work but reuses cached allocations instead of
@@ -25,13 +31,10 @@
 // =============================================================================
 
 using System;
-using System.Collections.Generic;
 using System.IO;
-using System.Linq;
 using System.Net;
 using System.Reflection;
 using System.Text;
-using System.Threading;
 using HarmonyLib;
 
 namespace Doorstop
@@ -47,6 +50,11 @@ namespace Doorstop
             PatchOscMessage();
             PatchMlModelMasks();
             PatchKinematicsStream();
+            PatchControllerStream();
+            PatchOrientationStream();
+            // Note: VmcStreaming.Send also allocates object[8] per bone (up to 2400/sec),
+            // but reimplementing its Quaternion.Slerp math via reflection is too costly.
+            // The MONO_GC_PARAMS mark-stack-size increase handles the remaining pressure.
 
             Entrypoint.Log("  Harmony patches applied successfully");
         }
@@ -445,6 +453,322 @@ namespace Doorstop
             {
                 Entrypoint.Log($"  KinematicsPrefix error (falling back to original): {ex.Message}");
                 return true; // Let original run on error
+            }
+        }
+
+        // =====================================================================
+        // PATCH 4: ControllerStream.ControllerMessage
+        // Original: new object[17] per frame per glove (120 calls/sec with 2 gloves)
+        // Fixed:    Thread-local cached object[17] reused each frame
+        // Impact:   Eliminates object[17] alloc × 120 calls/sec
+        // =====================================================================
+
+        [ThreadStatic] private static object[] _controllerBuffer;
+
+        // Cached reflection targets for ControllerStream (resolved once at patch time)
+        private static PropertyInfo _dfTimecodeProp;
+        private static PropertyInfo _dfProfileGloveProp;
+        private static PropertyInfo _dfControllerProp;
+        private static PropertyInfo _pgProfileIdProp;
+        private static PropertyInfo _pgHandednessProp;
+        private static PropertyInfo _pgGloveIdProp;
+        private static PropertyInfo _pidPerformerIdProp;
+        private static PropertyInfo _ctrlIsDisabledProp;
+        private static PropertyInfo _ctrlIsBindingProp;
+        private static MethodInfo _ctrlIsPressedMethod;
+        private static MethodInfo _ctrlGetButtonStateMethod;
+        private static PropertyInfo _buttonStateScalarProp;
+        private static PropertyInfo _buttonStateAxesProp;
+        private static PropertyInfo _axesXProp;
+        private static PropertyInfo _axesYProp;
+        private static MethodInfo _oscConstructMethod;
+
+        // Cached enum values (Enum.Parse allocates each call!)
+        private static object _btnIdle, _btnGrip, _btnButton1, _btnButton2;
+        private static object _btnTrigger, _btnMenu, _btnJoystick, _btnPinch;
+
+        // Pre-allocated arg arrays for Method.Invoke (avoids new object[] per call)
+        private static object[] _invokeArgIdle, _invokeArgGrip, _invokeArgButton1, _invokeArgButton2;
+        private static object[] _invokeArgTrigger, _invokeArgMenu, _invokeArgJoystick, _invokeArgPinch;
+
+        private static void PatchControllerStream()
+        {
+            var pipelineAsm = FindAssembly("StretchSense.Pipeline");
+            var csType = pipelineAsm.GetType("StretchSense.Pipeline.ControllerStream");
+            if (csType == null)
+            {
+                Entrypoint.Log("  WARNING: ControllerStream not found, skipping patch");
+                return;
+            }
+
+            var dataFrameType = pipelineAsm.GetType("StretchSense.Pipeline.DataFrame");
+            var method = csType.GetMethod("ControllerMessage",
+                BindingFlags.Instance | BindingFlags.NonPublic,
+                null, new[] { dataFrameType }, null);
+
+            if (method == null)
+            {
+                Entrypoint.Log("  WARNING: ControllerMessage not found, skipping patch");
+                return;
+            }
+
+            // Cache all reflection targets at patch time (not per-frame!)
+            _dfTimecodeProp = dataFrameType.GetProperty("Timecode");
+            _dfProfileGloveProp = dataFrameType.GetProperty("ProfileGlove");
+            _dfControllerProp = dataFrameType.GetProperty("Controller");
+
+            var profileGloveType = pipelineAsm.GetType("StretchSense.Pipeline.ProfileGlove");
+            _pgProfileIdProp = profileGloveType.GetProperty("ProfileId");
+            _pgHandednessProp = profileGloveType.GetProperty("Handedness");
+            _pgGloveIdProp = profileGloveType.GetProperty("GloveId");
+
+            var profileIdType = pipelineAsm.GetType("StretchSense.Pipeline.ProfileId");
+            _pidPerformerIdProp = profileIdType.GetProperty("PerformerId");
+
+            var controllerType = pipelineAsm.GetType("StretchSense.Pipeline.ControllerData");
+            if (controllerType == null)
+            {
+                // Try getting type from the property itself
+                controllerType = _dfControllerProp.PropertyType;
+            }
+            _ctrlIsDisabledProp = controllerType.GetProperty("IsControllerOutputDisabled");
+            _ctrlIsBindingProp = controllerType.GetProperty("IsControllerBinding");
+            _ctrlIsPressedMethod = controllerType.GetMethod("IsPressed");
+            _ctrlGetButtonStateMethod = controllerType.GetMethod("GetButtonState");
+
+            var oscMsgType = pipelineAsm.GetType("StretchSense.Pipeline.OscMessage");
+            _oscConstructMethod = oscMsgType.GetMethod("Construct",
+                BindingFlags.Static | BindingFlags.Public);
+
+            // Cache enum values
+            var buttonEnum = pipelineAsm.GetType("StretchSense.Pipeline.ControllerButton");
+            _btnIdle = Enum.Parse(buttonEnum, "IDLE");
+            _btnGrip = Enum.Parse(buttonEnum, "GRIP");
+            _btnButton1 = Enum.Parse(buttonEnum, "BUTTON_1");
+            _btnButton2 = Enum.Parse(buttonEnum, "BUTTON_2");
+            _btnTrigger = Enum.Parse(buttonEnum, "TRIGGER");
+            _btnMenu = Enum.Parse(buttonEnum, "MENU");
+            _btnJoystick = Enum.Parse(buttonEnum, "JOYSTICK_AXES");
+            _btnPinch = Enum.Parse(buttonEnum, "PINCH");
+
+            // Pre-allocate arg arrays for Method.Invoke
+            _invokeArgIdle = new object[] { _btnIdle };
+            _invokeArgGrip = new object[] { _btnGrip };
+            _invokeArgButton1 = new object[] { _btnButton1 };
+            _invokeArgButton2 = new object[] { _btnButton2 };
+            _invokeArgTrigger = new object[] { _btnTrigger };
+            _invokeArgMenu = new object[] { _btnMenu };
+            _invokeArgJoystick = new object[] { _btnJoystick };
+            _invokeArgPinch = new object[] { _btnPinch };
+
+            var prefix = typeof(GcPressurePatches).GetMethod(nameof(ControllerMessagePrefix),
+                BindingFlags.Static | BindingFlags.NonPublic);
+
+            _harmony.Patch(method, new HarmonyMethod(prefix));
+            Entrypoint.Log("  Patched ControllerStream.ControllerMessage (cached object[17])");
+        }
+
+        private static bool ControllerMessagePrefix(object __instance, object df, ref byte[] __result)
+        {
+            try
+            {
+                if (_controllerBuffer == null) _controllerBuffer = new object[17];
+                var buf = _controllerBuffer;
+
+                var timecode = _dfTimecodeProp.GetValue(df);
+                var profileGlove = _dfProfileGloveProp.GetValue(df);
+                var controller = _dfControllerProp.GetValue(df);
+
+                var profileId = _pgProfileIdProp.GetValue(profileGlove);
+                var performerId = _pidPerformerIdProp.GetValue(profileId);
+                var handedness = (int)_pgHandednessProp.GetValue(profileGlove);
+                var gloveId = _pgGloveIdProp.GetValue(profileGlove);
+
+                bool isDisabled = (bool)_ctrlIsDisabledProp.GetValue(controller);
+                bool isBinding = (bool)_ctrlIsBindingProp.GetValue(controller);
+                bool shouldClear = isDisabled || isBinding;
+
+                buf[0] = timecode;
+                buf[1] = performerId;
+                buf[2] = handedness;
+                buf[3] = gloveId;
+                buf[4] = "Reality Glove";
+
+                if (shouldClear)
+                {
+                    buf[5] = 0; buf[6] = 0; buf[7] = 0f;
+                    buf[8] = 0; buf[9] = 0; buf[10] = 0; buf[11] = 0f;
+                    buf[12] = 0; buf[13] = 0f; buf[14] = 0f;
+                    buf[15] = 0; buf[16] = 0f;
+                }
+                else
+                {
+                    // Pre-allocated arg arrays (cached enum values, reused each frame)
+                    var idleArg = _invokeArgIdle;
+                    var gripArg = _invokeArgGrip;
+                    var b1Arg = _invokeArgButton1;
+                    var b2Arg = _invokeArgButton2;
+                    var trigArg = _invokeArgTrigger;
+                    var menuArg = _invokeArgMenu;
+                    var joyArg = _invokeArgJoystick;
+                    var pinchArg = _invokeArgPinch;
+
+                    // OscUtils.ToInt(bool) is just b ? 1 : 0, inline it to avoid Invoke allocs
+                    buf[5] = (bool)_ctrlIsPressedMethod.Invoke(controller, idleArg) ? 1 : 0;
+                    buf[6] = (bool)_ctrlIsPressedMethod.Invoke(controller, gripArg) ? 1 : 0;
+
+                    var gripState = _ctrlGetButtonStateMethod.Invoke(controller, gripArg);
+                    if (_buttonStateScalarProp == null)
+                    {
+                        var bsType = gripState.GetType();
+                        _buttonStateScalarProp = bsType.GetProperty("Scalar");
+                        _buttonStateAxesProp = bsType.GetProperty("Axes");
+                    }
+                    buf[7] = (float)_buttonStateScalarProp.GetValue(gripState);
+
+                    buf[8] = (bool)_ctrlIsPressedMethod.Invoke(controller, b1Arg) ? 1 : 0;
+                    buf[9] = (bool)_ctrlIsPressedMethod.Invoke(controller, b2Arg) ? 1 : 0;
+                    buf[10] = (bool)_ctrlIsPressedMethod.Invoke(controller, trigArg) ? 1 : 0;
+
+                    var triggerState = _ctrlGetButtonStateMethod.Invoke(controller, trigArg);
+                    buf[11] = (float)_buttonStateScalarProp.GetValue(triggerState);
+
+                    buf[12] = (bool)_ctrlIsPressedMethod.Invoke(controller, menuArg) ? 1 : 0;
+
+                    var joystickState = _ctrlGetButtonStateMethod.Invoke(controller, joyArg);
+                    var axes = _buttonStateAxesProp.GetValue(joystickState);
+                    if (_axesXProp == null)
+                    {
+                        var axesType = axes.GetType();
+                        _axesXProp = axesType.GetProperty("X");
+                        _axesYProp = axesType.GetProperty("Y");
+                    }
+                    buf[13] = (float)_axesXProp.GetValue(axes);
+                    buf[14] = (float)_axesYProp.GetValue(axes);
+
+                    buf[15] = (bool)_ctrlIsPressedMethod.Invoke(controller, pinchArg) ? 1 : 0;
+
+                    var pinchState = _ctrlGetButtonStateMethod.Invoke(controller, pinchArg);
+                    buf[16] = (float)_buttonStateScalarProp.GetValue(pinchState);
+                }
+
+                __result = (byte[])_oscConstructMethod.Invoke(null,
+                    new object[] { "/v1/controller_input/all", buf });
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Entrypoint.Log($"  ControllerMessagePrefix error (falling back): {ex.Message}");
+                return true;
+            }
+        }
+
+        // =====================================================================
+        // PATCH 5: OrientationStream.OrientationMessage
+        // Original: new object[12] per frame per glove (120 calls/sec with 2 gloves)
+        // Fixed:    Thread-local cached object[12] reused each frame
+        // Impact:   Eliminates object[12] alloc × 120 calls/sec
+        // =====================================================================
+
+        [ThreadStatic] private static object[] _orientationBuffer;
+
+        // Cached reflection targets for OrientationStream
+        private static PropertyInfo _dfGloveOrientationProp;
+        private static PropertyInfo _goAccelerometerProp;
+        private static PropertyInfo _goOrientationProp;
+        private static PropertyInfo _vecXProp, _vecYProp, _vecZProp;
+        private static PropertyInfo _quatXProp, _quatYProp, _quatZProp, _quatWProp;
+
+        private static void PatchOrientationStream()
+        {
+            var pipelineAsm = FindAssembly("StretchSense.Pipeline");
+            var osType = pipelineAsm.GetType("StretchSense.Pipeline.OrientationStream");
+            if (osType == null)
+            {
+                Entrypoint.Log("  WARNING: OrientationStream not found, skipping patch");
+                return;
+            }
+
+            var dataFrameType = pipelineAsm.GetType("StretchSense.Pipeline.DataFrame");
+            var method = osType.GetMethod("OrientationMessage",
+                BindingFlags.Instance | BindingFlags.NonPublic,
+                null, new[] { dataFrameType }, null);
+
+            if (method == null)
+            {
+                Entrypoint.Log("  WARNING: OrientationMessage not found, skipping patch");
+                return;
+            }
+
+            // Cache reflection targets
+            _dfGloveOrientationProp = dataFrameType.GetProperty("GloveOrientation");
+
+            var gloveOrientType = _dfGloveOrientationProp.PropertyType;
+            _goAccelerometerProp = gloveOrientType.GetProperty("Accelerometer");
+            _goOrientationProp = gloveOrientType.GetProperty("Orientation");
+
+            // Vector3 properties (accelerometer)
+            var vecType = _goAccelerometerProp.PropertyType;
+            _vecXProp = vecType.GetProperty("X");
+            _vecYProp = vecType.GetProperty("Y");
+            _vecZProp = vecType.GetProperty("Z");
+
+            // Quaternion properties (orientation)
+            var quatType = _goOrientationProp.PropertyType;
+            _quatXProp = quatType.GetProperty("X");
+            _quatYProp = quatType.GetProperty("Y");
+            _quatZProp = quatType.GetProperty("Z");
+            _quatWProp = quatType.GetProperty("W");
+
+            var prefix = typeof(GcPressurePatches).GetMethod(nameof(OrientationMessagePrefix),
+                BindingFlags.Static | BindingFlags.NonPublic);
+
+            _harmony.Patch(method, new HarmonyMethod(prefix));
+            Entrypoint.Log("  Patched OrientationStream.OrientationMessage (cached object[12])");
+        }
+
+        private static bool OrientationMessagePrefix(object __instance, object df, ref byte[] __result)
+        {
+            try
+            {
+                if (_orientationBuffer == null) _orientationBuffer = new object[12];
+                var buf = _orientationBuffer;
+
+                var timecode = _dfTimecodeProp.GetValue(df);
+                var profileGlove = _dfProfileGloveProp.GetValue(df);
+                var gloveOrientation = _dfGloveOrientationProp.GetValue(df);
+
+                var profileId = _pgProfileIdProp.GetValue(profileGlove);
+                var performerId = _pidPerformerIdProp.GetValue(profileId);
+                var handedness = (int)_pgHandednessProp.GetValue(profileGlove);
+                var gloveId = _pgGloveIdProp.GetValue(profileGlove);
+
+                var accel = _goAccelerometerProp.GetValue(gloveOrientation);
+                var orientation = _goOrientationProp.GetValue(gloveOrientation);
+
+                buf[0] = timecode;
+                buf[1] = performerId;
+                buf[2] = handedness;
+                buf[3] = gloveId;
+                buf[4] = "Reality Glove";
+                buf[5] = (float)_vecXProp.GetValue(accel);
+                buf[6] = (float)_vecYProp.GetValue(accel);
+                buf[7] = (float)_vecZProp.GetValue(accel);
+                buf[8] = (float)_quatXProp.GetValue(orientation);
+                buf[9] = (float)_quatYProp.GetValue(orientation);
+                buf[10] = (float)_quatZProp.GetValue(orientation);
+                buf[11] = (float)_quatWProp.GetValue(orientation);
+
+                __result = (byte[])_oscConstructMethod.Invoke(null,
+                    new object[] { "/v1/orientation/all", buf });
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Entrypoint.Log($"  OrientationMessagePrefix error (falling back): {ex.Message}");
+                return true;
             }
         }
 

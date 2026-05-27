@@ -6,6 +6,16 @@
 bepinex-staging/
 doorstop4-staging/
 decompiled/
+dist/
+dumps/
+MonoBleedingEdge/
+XR Game/
+XR Game_Data/
+bluetooth-grep.txt
+decompiled-bluetooth-grep.txt
+file-list.txt
+launch_xrgame_gc_fix.bat
+windbg-gchandle-instrumentation.txt
 *.zip
 
 # IDE

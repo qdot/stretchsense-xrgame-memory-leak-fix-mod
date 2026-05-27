@@ -35,9 +35,40 @@ namespace Doorstop
         internal static readonly string OurDirectory =
             Path.GetDirectoryName(typeof(Entrypoint).Assembly.Location) ?? ".";
 
+        // Native fallback used when this Unity/Mono build ignores or later overrides
+        // MONO_GC_PARAMS. Soak testing showed Mono grows its stack in stages up to at
+        // least 8MB; 32MB gives headroom without the larger 64MB test footprint.
+        private const long TargetNativeMarkStackBytes = 32L * 1024 * 1024;
+
         public static void Start()
         {
-            Log("DoorstopFix v2.0 loaded - waiting for game assemblies...");
+            // Increase Boehm GC mark stack size as a safety net.
+            // Default starts small and grows in stages; 32MB gives headroom without
+            // keeping a 64MB native side allocation alive for every reset.
+            // NOTE: Mono reads MONO_GC_PARAMS during GC initialization. Doorstop loads us
+            // early enough that setting it here MAY work (depends on Unity's init order).
+            // If this doesn't take effect, users can set it as a system environment variable
+            // or use the provided launch script.
+            if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("MONO_GC_PARAMS")))
+            {
+                Environment.SetEnvironmentVariable("MONO_GC_PARAMS", $"mark-stack-size={TargetNativeMarkStackBytes}");
+                Log($"Set MONO_GC_PARAMS=mark-stack-size={TargetNativeMarkStackBytes}");
+            }
+            else
+            {
+                Log($"MONO_GC_PARAMS already set: {Environment.GetEnvironmentVariable("MONO_GC_PARAMS")}");
+            }
+
+            try
+            {
+                NativeMarkStackPatch.Apply(TargetNativeMarkStackBytes);
+            }
+            catch (Exception ex)
+            {
+                Log($"ERROR in native mark stack patch: {ex}");
+            }
+
+            Log("DoorstopFix v3.4.7 monitored native mark stack + BLE guard loaded - waiting for game assemblies...");
             AppDomain.CurrentDomain.AssemblyLoad += OnAssemblyLoad;
         }
 
@@ -128,9 +159,65 @@ namespace Doorstop
                         }
                     }
 
+                    try
+                    {
+                        NativeMarkStackPatch.Apply(TargetNativeMarkStackBytes);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"ERROR in deferred native mark stack patch: {ex}");
+                    }
+
                     ApplyHarmonyPatches();
+                    StartNativeMarkStackMonitor();
+                    StartHeapMonitor();
                 });
             }
+        }
+
+        private static void StartNativeMarkStackMonitor()
+        {
+            // Mono may replace these globals later as the heap grows. Keep checking so
+            // a later reset to 1/2/4/8MB does not reintroduce the overflow crash.
+            Log("Native mark stack monitor started (checking every 5s)");
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                while (true)
+                {
+                    Thread.Sleep(5000);
+                    try
+                    {
+                        NativeMarkStackPatch.Apply(TargetNativeMarkStackBytes, quietWhenAlreadyPatched: true);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"ERROR in native mark stack monitor: {ex.Message}");
+                    }
+                }
+            });
+        }
+
+        /// <summary>
+        /// Periodically logs managed heap size so we can track accumulation over time.
+        /// Runs on a background thread every 60 seconds. Output goes to the same log file.
+        /// </summary>
+        private static void StartHeapMonitor()
+        {
+            Log("Heap monitor started (logging every 60s)");
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                long lastHeap = 0;
+                while (true)
+                {
+                    Thread.Sleep(60000);
+                    long heap = GC.GetTotalMemory(false);
+                    long delta = heap - lastHeap;
+                    string deltaStr = lastHeap == 0 ? "---" :
+                        $"{(delta >= 0 ? "+" : "")}{delta / 1024}KB";
+                    Log($"[HEAP] {heap / 1024 / 1024}MB ({deltaStr} since last) | GC counts: gen0={GC.CollectionCount(0)} gen1={GC.CollectionCount(1)} gen2={GC.CollectionCount(2)}");
+                    lastHeap = heap;
+                }
+            });
         }
 
         /// <summary>
@@ -146,6 +233,15 @@ namespace Doorstop
 
             // NOW it's safe to register the assembly resolver for Harmony's deps
             AppDomain.CurrentDomain.AssemblyResolve += ResolveOurDependencies;
+
+            try
+            {
+                BluetoothLeakPatches.Apply();
+            }
+            catch (Exception ex)
+            {
+                Log($"ERROR in Bluetooth leak patches: {ex}");
+            }
 
             try
             {
